@@ -198,6 +198,12 @@ def load_combined_dataframe(cfg: SeriousConvLSTMConfig) -> pd.DataFrame:
             raise ValueError(f"Column {col} differs between CSV and pickle in {mismatch_count} rows")
 
     df = data_df.copy()
+    concentration = pd.to_numeric(df["concentration"], errors="coerce")
+    invalid_concentration = df["concentration"].notna() & concentration.isna()
+    if invalid_concentration.any():
+        invalid_values = sorted(df.loc[invalid_concentration, "concentration"].astype(str).unique())
+        raise ValueError(f"Concentration must be numeric; invalid values: {invalid_values}")
+    df["concentration"] = concentration.astype(float)
     df["image_array"] = images_df["image_array"].values
     df["run_id_str"] = df["run_id"].astype("string")
     df["run_key"] = (
@@ -478,6 +484,10 @@ class TabularPreprocessor:
         rest = [col for col in numeric if col not in forced and col not in extras]
         self.numeric_cols = forced + extras + rest
         self.categorical_cols = [col for col in self.cfg.categorical_cols if col in df_model.columns]
+        if "concentration" in self.categorical_cols:
+            raise ValueError("Concentration must be a continuous numeric feature, not a categorical feature.")
+        if "concentration" not in self.numeric_cols:
+            raise ValueError("Concentration is missing from the numeric model features.")
 
         train_numeric = df_model.loc[train_positions, self.numeric_cols].replace([np.inf, -np.inf], np.nan)
         observed_counts = train_numeric.notna().sum()
@@ -1099,15 +1109,25 @@ def evaluate_extra_metrics(
     if hl_pred:
         pred = np.concatenate(hl_pred)
         true = np.concatenate(hl_true)
+        total_variance = float(np.sum((true - np.mean(true)) ** 2))
+        r2 = float(1.0 - np.sum((pred - true) ** 2) / total_variance) if total_variance > 0 else np.nan
         metrics.update(
             {
                 "half_life_mae_sec": float(np.mean(np.abs(pred - true))),
                 "half_life_rmse_sec": float(np.sqrt(np.mean((pred - true) ** 2))),
+                "half_life_r2": r2,
                 "half_life_n": int(len(true)),
             }
         )
     else:
-        metrics.update({"half_life_mae_sec": np.nan, "half_life_rmse_sec": np.nan, "half_life_n": 0})
+        metrics.update(
+            {
+                "half_life_mae_sec": np.nan,
+                "half_life_rmse_sec": np.nan,
+                "half_life_r2": np.nan,
+                "half_life_n": 0,
+            }
+        )
     if censored_pred:
         pred = np.concatenate(censored_pred)
         lower = np.concatenate(censored_lower_bound)
@@ -1128,6 +1148,56 @@ def evaluate_extra_metrics(
             }
         )
     return metrics
+
+
+def compute_run_level_half_life_metrics(predictions: pd.DataFrame) -> dict[str, float | int]:
+    """Score one averaged half-life prediction per observed experimental run."""
+
+    required = {
+        "surfactant",
+        "nanoparticle",
+        "concentration",
+        "run_id",
+        "pred_half_life_sec",
+        "actual_half_life_sec",
+        "half_life_observed",
+    }
+    missing = sorted(required.difference(predictions.columns))
+    if missing:
+        raise ValueError(f"Half-life predictions are missing columns: {missing}")
+
+    valid = predictions[
+        (predictions["half_life_observed"].astype(float) > 0.5)
+        & np.isfinite(pd.to_numeric(predictions["actual_half_life_sec"], errors="coerce"))
+        & np.isfinite(pd.to_numeric(predictions["pred_half_life_sec"], errors="coerce"))
+    ].copy()
+    if valid.empty:
+        return {
+            "half_life_run_rmse_sec": np.nan,
+            "half_life_run_r2": np.nan,
+            "half_life_run_n": 0,
+        }
+
+    run_cols = ["surfactant", "nanoparticle", "concentration", "run_id"]
+    run_predictions = (
+        valid.groupby(run_cols, dropna=False)
+        .agg(
+            actual_half_life_sec=("actual_half_life_sec", "mean"),
+            pred_half_life_sec=("pred_half_life_sec", "mean"),
+        )
+        .reset_index()
+    )
+    true = run_predictions["actual_half_life_sec"].to_numpy(dtype=np.float64)
+    pred = run_predictions["pred_half_life_sec"].to_numpy(dtype=np.float64)
+    squared_error = (pred - true) ** 2
+    total_variance = float(np.sum((true - np.mean(true)) ** 2))
+    return {
+        "half_life_run_rmse_sec": float(np.sqrt(np.mean(squared_error))),
+        "half_life_run_r2": float(1.0 - np.sum(squared_error) / total_variance)
+        if total_variance > 0
+        else np.nan,
+        "half_life_run_n": int(len(run_predictions)),
+    }
 
 
 def train_model(
