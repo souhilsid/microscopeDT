@@ -373,6 +373,15 @@ def generated_live_gif(predictions: list[dict], frame_count: int = 30, size: int
 def build_results_document(config: dict, live_run_key: str | None, live_hl: pd.DataFrame, selected_detail: dict) -> bytes:
     predicted_half_life = float(live_hl["pred_half_life_sec"].mean()) if not live_hl.empty else np.nan
     actual_half_life = float(live_hl["actual_half_life_sec"].mean()) if "actual_half_life_sec" in live_hl and not live_hl.empty else np.nan
+    reference_half_life = (
+        float(live_hl["reference_half_life_sec"].mean())
+        if "reference_half_life_sec" in live_hl and not live_hl.empty
+        else np.nan
+    )
+    if np.isfinite(actual_half_life):
+        measured_result_line = f"- Actual half-life: {fmt(actual_half_life, 1, ' s')}"
+    else:
+        measured_result_line = f"- Measured reference half-life: {fmt(reference_half_life, 1, ' s')}"
     lines = [
         "# Microscopy Bubble Forecasting Result",
         "",
@@ -390,7 +399,7 @@ def build_results_document(config: dict, live_run_key: str | None, live_hl: pd.D
         "",
         "## Prediction",
         "",
-        f"- Actual half-life: {fmt(actual_half_life, 1, ' s')}",
+        measured_result_line,
         f"- Predicted half-life: {fmt(predicted_half_life, 1, ' s')}",
         f"- Generated frames: {len(live_hl)}",
         "",
@@ -460,6 +469,8 @@ def predictions_to_half_life_frame(predictions: list[dict]) -> pd.DataFrame:
             {
                 "time_sec": pred["bd_t_sec"],
                 "actual_half_life_sec": pred["actual_half_life_sec"],
+                "reference_half_life_sec": pred["reference_half_life_sec"],
+                "reference_half_life_is_lower_bound": pred["reference_half_life_is_lower_bound"],
                 "pred_half_life_sec": pred["pred_half_life_sec"],
             }
             for pred in predictions
@@ -483,6 +494,12 @@ def blend_predictions(lower_predictions: list[dict], upper_predictions: list[dic
                 "predicted": (1 - weight) * low["predicted"] + weight * high["predicted"],
                 "pred_half_life_sec": (1 - weight) * low["pred_half_life_sec"] + weight * high["pred_half_life_sec"],
                 "actual_half_life_sec": (1 - weight) * low["actual_half_life_sec"] + weight * high["actual_half_life_sec"],
+                "reference_half_life_sec": (1 - weight) * low["reference_half_life_sec"]
+                + weight * high["reference_half_life_sec"],
+                "reference_half_life_is_lower_bound": bool(
+                    low["reference_half_life_is_lower_bound"]
+                    or high["reference_half_life_is_lower_bound"]
+                ),
             }
         )
     return blended
@@ -576,9 +593,12 @@ def predict_live_window(
     )
     row = df_model.loc[target_pos]
     measured_concentration = float(row["concentration"])
+    measured_half_life = float(row["half_life_sec"]) if pd.notna(row.get("half_life_sec")) else np.nan
+    censor_duration = float(row["half_life_censor_sec"]) if pd.notna(row.get("half_life_censor_sec")) else np.nan
+    reference_half_life = measured_half_life if np.isfinite(measured_half_life) else censor_duration
     actual_half_life = (
-        float(row["half_life_sec"])
-        if np.isclose(requested_concentration, measured_concentration) and pd.notna(row.get("half_life_sec"))
+        measured_half_life
+        if np.isclose(requested_concentration, measured_concentration) and np.isfinite(measured_half_life)
         else np.nan
     )
     return {
@@ -590,6 +610,8 @@ def predict_live_window(
         "predicted": pred,
         "pred_half_life_sec": pred_hl_sec,
         "actual_half_life_sec": actual_half_life,
+        "reference_half_life_sec": reference_half_life,
+        "reference_half_life_is_lower_bound": not np.isfinite(measured_half_life),
     }
 
 
@@ -835,15 +857,38 @@ else:
     if prediction_result and prediction_result.get("config") == current_config and live_predictions:
         predicted_half_life = float(live_hl["pred_half_life_sec"].mean()) if not live_hl.empty else np.nan
         actual_half_life = float(live_hl["actual_half_life_sec"].mean()) if "actual_half_life_sec" in live_hl and not live_hl.empty else np.nan
+        reference_half_life = (
+            float(live_hl["reference_half_life_sec"].mean())
+            if "reference_half_life_sec" in live_hl and not live_hl.empty
+            else np.nan
+        )
+        reference_is_lower_bound = bool(
+            live_hl["reference_half_life_is_lower_bound"].any()
+            if "reference_half_life_is_lower_bound" in live_hl and not live_hl.empty
+            else False
+        )
+        if np.isfinite(actual_half_life):
+            measured_label = "Actual half-life"
+            measured_value = fmt(actual_half_life, 1)
+            measured_note = f"Measured at concentration {concentration}"
+        else:
+            measured_label = "Measured reference half-life"
+            measured_value = (
+                f"> {fmt(reference_half_life, 1)}"
+                if reference_is_lower_bound
+                else fmt(reference_half_life, 1)
+            )
+            measured_note = microscopy_basis
         st.subheader("Prediction Result")
         result_cols = st.columns([0.46, 0.54], gap="large")
         with result_cols[0]:
             st.markdown(
                 f"""
                 <div class="prediction-card actual-card">
-                    <div class="prediction-label">Actual half-life</div>
-                    <div class="prediction-value">{fmt(actual_half_life, 1)}</div>
+                    <div class="prediction-label">{measured_label}</div>
+                    <div class="prediction-value">{measured_value}</div>
                     <div class="prediction-unit">seconds</div>
+                    <div class="prediction-note">{measured_note}</div>
                 </div>
                 <div class="prediction-card predicted-card">
                     <div class="prediction-label">Predicted half-life</div>
@@ -888,7 +933,8 @@ else:
 
         selected_detail = {
             "target_time_sec": fmt(sample["bd_t_sec"], 2),
-            "actual_half_life_sec": fmt(actual_half_life, 2),
+            "actual_half_life_sec": fmt(actual_half_life, 2) if np.isfinite(actual_half_life) else "Not measured",
+            "measured_reference_half_life_sec": fmt(reference_half_life, 2),
             "predicted_half_life_sec": fmt(predicted_half_life, 2),
         }
         report_bytes = build_results_document(current_config, live_run_key, live_hl, selected_detail)
