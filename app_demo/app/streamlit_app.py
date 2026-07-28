@@ -317,6 +317,7 @@ def load_live_bundle():
         "device": device,
         "model": model,
         "checkpoint": checkpoint,
+        "preprocessor": preprocessor,
         "df_model": df_model,
         "features": features,
     }
@@ -383,6 +384,7 @@ def build_results_document(config: dict, live_run_key: str | None, live_hl: pd.D
         f"- Nanoparticle: {config['nanoparticle']}",
         f"- Concentration: {config['concentration']}",
         f"- Concentration basis: {config.get('concentration_basis', 'Measured')}",
+        f"- Microscopy basis: {config.get('microscopy_basis', 'Selected experiment')}",
         f"- Window start: {config['start_t']:.1f} s",
         f"- Window end: {config['end_t']:.1f} s",
         "",
@@ -435,6 +437,7 @@ def run_prediction_at_concentration(live_bundle: dict, config: dict, concentrati
         config["surfactant"],
         config["nanoparticle"],
         concentration,
+        float(config["concentration_value"]),
         config["start_t"],
         config["end_t"],
         config["frame_gap"],
@@ -534,7 +537,12 @@ def valid_starts(bundle: dict, positions: np.ndarray) -> list[int]:
     return starts
 
 
-def predict_live_window(bundle: dict, positions: np.ndarray, start: int) -> dict:
+def predict_live_window(
+    bundle: dict,
+    positions: np.ndarray,
+    start: int,
+    requested_concentration: float,
+) -> dict:
     cfg = bundle["cfg"]
     input_stride = max(1, int(getattr(cfg, "input_frame_stride", 1)))
     input_offsets = start + np.arange(cfg.seq_len) * input_stride
@@ -547,7 +555,11 @@ def predict_live_window(bundle: dict, positions: np.ndarray, start: int) -> dict
         [image_tensor(df_model.loc[int(pos), "image_array"], cfg.image_size) for pos in input_positions],
         dim=0,
     ).unsqueeze(0)
-    features = torch.from_numpy(bundle["features"][input_positions]).float().unsqueeze(0)
+    feature_frame = df_model.loc[input_positions].copy()
+    feature_frame["concentration"] = float(requested_concentration)
+    feature_values = bundle["preprocessor"].transform(feature_frame)
+    feature_values = np.nan_to_num(feature_values, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    features = torch.from_numpy(feature_values).float().unsqueeze(0)
 
     with torch.no_grad():
         pred_image, pred_hl = bundle["model"](images.to(bundle["device"]), features.to(bundle["device"]))
@@ -563,6 +575,12 @@ def predict_live_window(bundle: dict, positions: np.ndarray, start: int) -> dict
         ).reshape(-1)[0]
     )
     row = df_model.loc[target_pos]
+    measured_concentration = float(row["concentration"])
+    actual_half_life = (
+        float(row["half_life_sec"])
+        if np.isclose(requested_concentration, measured_concentration) and pd.notna(row.get("half_life_sec"))
+        else np.nan
+    )
     return {
         "target_pos": target_pos,
         "bd_t_sec": float(row["bd_t [s]"]),
@@ -571,7 +589,7 @@ def predict_live_window(bundle: dict, positions: np.ndarray, start: int) -> dict
         "reference": reference,
         "predicted": pred,
         "pred_half_life_sec": pred_hl_sec,
-        "actual_half_life_sec": float(row["half_life_sec"]) if pd.notna(row.get("half_life_sec")) else np.nan,
+        "actual_half_life_sec": actual_half_life,
     }
 
 
@@ -602,12 +620,13 @@ def live_sequence_predictions(
     bundle: dict,
     surfactant: str,
     nanoparticle: str,
-    concentration: str,
+    reference_concentration: str,
+    requested_concentration: float,
     start_t: float,
     end_t: float,
     frame_gap: int,
 ) -> tuple[str | None, list[dict]]:
-    run_key, positions, starts = select_live_run(bundle, surfactant, nanoparticle, concentration)
+    run_key, positions, starts = select_live_run(bundle, surfactant, nanoparticle, reference_concentration)
     if run_key is None:
         return None, []
 
@@ -628,7 +647,10 @@ def live_sequence_predictions(
         chosen_starts.append(starts[nearest])
     chosen_starts = sorted(dict.fromkeys(chosen_starts), key=lambda s: target_times[starts.index(s)])
 
-    return run_key, [predict_live_window(bundle, positions, s) for s in chosen_starts]
+    return run_key, [
+        predict_live_window(bundle, positions, s, requested_concentration)
+        for s in chosen_starts
+    ]
 
 
 st.markdown(
@@ -686,12 +708,18 @@ with st.sidebar:
     lower_concentration = conc_label(lower_conc)
     upper_concentration = conc_label(upper_conc)
     if lower_concentration == upper_concentration and np.isclose(concentration_value, lower_conc):
-        concentration_basis = f"Measured sample at {lower_concentration}"
+        concentration_basis = f"Measured concentration: {concentration}"
+        microscopy_basis = f"Reference microscopy: {lower_concentration}"
     elif lower_concentration == upper_concentration:
-        concentration_basis = f"Prediction uses closest measured sample: {lower_concentration}"
+        concentration_basis = f"Continuous AI estimate at {concentration}"
+        microscopy_basis = f"Reference microscopy: {lower_concentration}"
     else:
-        concentration_basis = f"Estimated between {lower_concentration} and {upper_concentration}"
-    st.markdown(f"<p class='small-note'>{concentration_basis}</p>", unsafe_allow_html=True)
+        concentration_basis = f"Continuous AI estimate at {concentration}"
+        microscopy_basis = f"Reference microscopy: {lower_concentration} and {upper_concentration}"
+    st.markdown(
+        f"<p class='small-note'>{concentration_basis}. {microscopy_basis}.</p>",
+        unsafe_allow_html=True,
+    )
 
 lower_data = selected_ready_subset(ready, surfactant, nanoparticle, lower_concentration)
 upper_data = selected_ready_subset(ready, surfactant, nanoparticle, upper_concentration)
@@ -762,10 +790,12 @@ else:
         "surfactant": surfactant,
         "nanoparticle": nanoparticle,
         "concentration": concentration,
+        "concentration_value": float(concentration_value),
         "lower_concentration": lower_concentration,
         "upper_concentration": upper_concentration,
         "interpolation_weight": interpolation_weight,
         "concentration_basis": concentration_basis,
+        "microscopy_basis": microscopy_basis,
         "start_t": float(start_t),
         "end_t": float(end_t),
         "frame_gap": int(frame_gap),
