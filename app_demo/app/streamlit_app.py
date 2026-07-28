@@ -382,6 +382,7 @@ def build_results_document(config: dict, live_run_key: str | None, live_hl: pd.D
         f"- Surfactant: {config['surfactant']}",
         f"- Nanoparticle: {config['nanoparticle']}",
         f"- Concentration: {config['concentration']}",
+        f"- Concentration basis: {config.get('concentration_basis', 'Measured')}",
         f"- Window start: {config['start_t']:.1f} s",
         f"- Window end: {config['end_t']:.1f} s",
         "",
@@ -401,27 +402,46 @@ def build_results_document(config: dict, live_run_key: str | None, live_hl: pd.D
 
 def run_prediction(config: dict) -> dict:
     live_bundle = load_live_bundle()
+    lower_conc = config["lower_concentration"]
+    upper_conc = config["upper_concentration"]
+    weight = float(config["interpolation_weight"])
+
+    if lower_conc == upper_conc or weight <= 0:
+        return run_prediction_at_concentration(live_bundle, config, lower_conc)
+    if weight >= 1:
+        return run_prediction_at_concentration(live_bundle, config, upper_conc)
+
+    lower_result = run_prediction_at_concentration(live_bundle, config, lower_conc)
+    upper_result = run_prediction_at_concentration(live_bundle, config, upper_conc)
+    blended_predictions = blend_predictions(
+        lower_result["live_predictions"],
+        upper_result["live_predictions"],
+        weight,
+    )
+    gif_bytes = generated_live_gif(blended_predictions, frame_count=config["generated_frame_count"]) if blended_predictions else b""
+    live_hl = predictions_to_half_life_frame(blended_predictions)
+    return {
+        "config": config,
+        "live_run_key": f"{lower_result['live_run_key']} + {upper_result['live_run_key']}",
+        "live_predictions": blended_predictions,
+        "gif_bytes": gif_bytes,
+        "live_hl": live_hl,
+    }
+
+
+def run_prediction_at_concentration(live_bundle: dict, config: dict, concentration: str) -> dict:
     live_run_key, live_predictions = live_sequence_predictions(
         live_bundle,
         config["surfactant"],
         config["nanoparticle"],
-        config["concentration"],
+        concentration,
         config["start_t"],
         config["end_t"],
         config["frame_gap"],
     )
     live_predictions = sorted(live_predictions, key=lambda item: item["bd_t_sec"])
     gif_bytes = generated_live_gif(live_predictions, frame_count=config["generated_frame_count"]) if live_predictions else b""
-    live_hl = pd.DataFrame(
-        [
-            {
-                "time_sec": pred["bd_t_sec"],
-                "actual_half_life_sec": pred["actual_half_life_sec"],
-                "pred_half_life_sec": pred["pred_half_life_sec"],
-            }
-            for pred in live_predictions
-        ]
-    )
+    live_hl = predictions_to_half_life_frame(live_predictions)
     return {
         "config": config,
         "live_run_key": live_run_key,
@@ -431,8 +451,52 @@ def run_prediction(config: dict) -> dict:
     }
 
 
+def predictions_to_half_life_frame(predictions: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "time_sec": pred["bd_t_sec"],
+                "actual_half_life_sec": pred["actual_half_life_sec"],
+                "pred_half_life_sec": pred["pred_half_life_sec"],
+            }
+            for pred in predictions
+        ]
+    )
+
+
+def blend_predictions(lower_predictions: list[dict], upper_predictions: list[dict], weight: float) -> list[dict]:
+    n = min(len(lower_predictions), len(upper_predictions))
+    blended: list[dict] = []
+    for i in range(n):
+        low = lower_predictions[i]
+        high = upper_predictions[i]
+        blended.append(
+            {
+                "target_pos": low["target_pos"],
+                "bd_t_sec": (1 - weight) * low["bd_t_sec"] + weight * high["bd_t_sec"],
+                "bd_row_idx": low["bd_row_idx"],
+                "last_input": (1 - weight) * low["last_input"] + weight * high["last_input"],
+                "reference": (1 - weight) * low["reference"] + weight * high["reference"],
+                "predicted": (1 - weight) * low["predicted"] + weight * high["predicted"],
+                "pred_half_life_sec": (1 - weight) * low["pred_half_life_sec"] + weight * high["pred_half_life_sec"],
+                "actual_half_life_sec": (1 - weight) * low["actual_half_life_sec"] + weight * high["actual_half_life_sec"],
+            }
+        )
+    return blended
+
+
 def filtered_options(df: pd.DataFrame, column: str) -> list[str]:
     return sorted([str(v) for v in df[column].dropna().unique()])
+
+
+def concentration_bounds(values: list[float], selected: float) -> tuple[float, float, float]:
+    arr = np.array(sorted(values), dtype=float)
+    lower = float(arr[arr <= selected].max()) if np.any(arr <= selected) else float(arr.min())
+    upper = float(arr[arr >= selected].min()) if np.any(arr >= selected) else float(arr.max())
+    if np.isclose(lower, upper):
+        return lower, upper, 0.0
+    weight = (selected - lower) / (upper - lower)
+    return lower, upper, float(np.clip(weight, 0.0, 1.0))
 
 
 def selected_ready_subset(
@@ -597,10 +661,33 @@ with st.sidebar:
     nanoparticle = st.selectbox("Nanoparticle", nano_options, index=0)
     nano_df = surf_df[surf_df["nanoparticle"] == nanoparticle]
 
-    conc_options = filtered_options(nano_df, "concentration_label")
-    concentration = st.selectbox("Concentration", conc_options, index=0)
+    conc_values = sorted(nano_df["concentration_value"].dropna().unique().astype(float).tolist())
+    min_conc = float(min(conc_values))
+    max_conc = float(max(conc_values))
+    conc_step = min(np.diff(sorted(conc_values))).item() / 10 if len(conc_values) > 1 else max_conc or 0.00001
+    concentration_value = st.slider(
+        "Concentration",
+        min_value=min_conc,
+        max_value=max_conc,
+        value=min_conc,
+        step=float(max(conc_step, 0.00001)),
+        format="%.5f",
+    )
+    lower_conc, upper_conc, interpolation_weight = concentration_bounds(conc_values, concentration_value)
+    concentration = conc_label(concentration_value)
+    lower_concentration = conc_label(lower_conc)
+    upper_concentration = conc_label(upper_conc)
+    if lower_concentration == upper_concentration:
+        concentration_basis = f"Measured concentration {lower_concentration}"
+    else:
+        concentration_basis = f"Interpolated between {lower_concentration} and {upper_concentration}"
+    st.markdown(f"<p class='small-note'>{concentration_basis}</p>", unsafe_allow_html=True)
 
-selected_data = selected_ready_subset(ready, surfactant, nanoparticle, concentration)
+lower_data = selected_ready_subset(ready, surfactant, nanoparticle, lower_concentration)
+upper_data = selected_ready_subset(ready, surfactant, nanoparticle, upper_concentration)
+selected_data = pd.concat([lower_data, upper_data], ignore_index=True).drop_duplicates(
+    subset=["surfactant", "nanoparticle", "concentration_label", "run_id_label", "bd_row_idx"]
+)
 
 if selected_data.empty:
     st.subheader("Selected Sample")
@@ -610,7 +697,7 @@ if selected_data.empty:
             <div class="summary-item"><div class="summary-label">Surfactant</div><div class="summary-value">{surfactant}</div></div>
             <div class="summary-item"><div class="summary-label">Nanoparticle</div><div class="summary-value">{nanoparticle}</div></div>
             <div class="summary-item"><div class="summary-label">Concentration</div><div class="summary-value">{concentration}</div></div>
-            <div class="summary-item"><div class="summary-label">Status</div><div class="summary-value">No sample</div></div>
+            <div class="summary-item"><div class="summary-label">Basis</div><div class="summary-value">{concentration_basis}</div></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -630,7 +717,7 @@ else:
         <div class="summary-grid">
             <div class="summary-item"><div class="summary-label">Frames</div><div class="summary-value">{len(selected_data)}</div></div>
             <div class="summary-item"><div class="summary-label">Frame Range</div><div class="summary-value">{frame_range}</div></div>
-            <div class="summary-item"><div class="summary-label">AI Model</div><div class="summary-value">Embedded</div></div>
+            <div class="summary-item"><div class="summary-label">Basis</div><div class="summary-value">{concentration_basis}</div></div>
             <div class="summary-item"><div class="summary-label">Status</div><div class="summary-value">Ready</div></div>
         </div>
         """,
@@ -665,6 +752,10 @@ else:
         "surfactant": surfactant,
         "nanoparticle": nanoparticle,
         "concentration": concentration,
+        "lower_concentration": lower_concentration,
+        "upper_concentration": upper_concentration,
+        "interpolation_weight": interpolation_weight,
+        "concentration_basis": concentration_basis,
         "start_t": float(start_t),
         "end_t": float(end_t),
         "frame_gap": int(frame_gap),
