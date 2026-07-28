@@ -661,36 +661,36 @@ with st.sidebar:
     nanoparticle = st.selectbox("Nanoparticle", nano_options, index=0)
     nano_df = surf_df[surf_df["nanoparticle"] == nanoparticle]
 
-    conc_values = sorted(nano_df["concentration_value"].dropna().unique().astype(float).tolist())
-    if not conc_values:
+    available_conc_values = sorted(nano_df["concentration_value"].dropna().unique().astype(float).tolist())
+    if not available_conc_values:
         st.error("No concentration data is available for this formulation.")
         st.stop()
-    min_conc = float(min(conc_values))
-    max_conc = float(max(conc_values))
-    if len(conc_values) == 1 or np.isclose(min_conc, max_conc):
-        concentration_value = min_conc
-        st.markdown(
-            f"<p class='small-note'><strong>Concentration:</strong> {conc_label(concentration_value)}</p>",
-            unsafe_allow_html=True,
-        )
-    else:
-        conc_step = min(np.diff(sorted(conc_values))).item() / 10
-        concentration_value = st.slider(
-            "Concentration",
-            min_value=min_conc,
-            max_value=max_conc,
-            value=min_conc,
-            step=float(max(conc_step, 0.00001)),
-            format="%.5f",
-        )
-    lower_conc, upper_conc, interpolation_weight = concentration_bounds(conc_values, concentration_value)
+
+    experimental_concentrations = [0.00625, 0.0125, 0.025, 0.05]
+    slider_conc_values = sorted(set(experimental_concentrations + available_conc_values))
+    min_conc = float(min(slider_conc_values))
+    max_conc = float(max(slider_conc_values))
+    conc_diffs = np.diff(slider_conc_values)
+    positive_diffs = conc_diffs[conc_diffs > 0]
+    conc_step = float(positive_diffs.min() / 10) if len(positive_diffs) else 0.00001
+    concentration_value = st.slider(
+        "Concentration",
+        min_value=min_conc,
+        max_value=max_conc,
+        value=float(available_conc_values[0]),
+        step=float(max(conc_step, 0.00001)),
+        format="%.5f",
+    )
+    lower_conc, upper_conc, interpolation_weight = concentration_bounds(available_conc_values, concentration_value)
     concentration = conc_label(concentration_value)
     lower_concentration = conc_label(lower_conc)
     upper_concentration = conc_label(upper_conc)
-    if lower_concentration == upper_concentration:
-        concentration_basis = f"Measured concentration {lower_concentration}"
+    if lower_concentration == upper_concentration and np.isclose(concentration_value, lower_conc):
+        concentration_basis = f"Measured sample at {lower_concentration}"
+    elif lower_concentration == upper_concentration:
+        concentration_basis = f"Prediction uses closest measured sample: {lower_concentration}"
     else:
-        concentration_basis = f"Interpolated between {lower_concentration} and {upper_concentration}"
+        concentration_basis = f"Estimated between {lower_concentration} and {upper_concentration}"
     st.markdown(f"<p class='small-note'>{concentration_basis}</p>", unsafe_allow_html=True)
 
 lower_data = selected_ready_subset(ready, surfactant, nanoparticle, lower_concentration)
