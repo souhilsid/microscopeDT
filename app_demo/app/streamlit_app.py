@@ -662,17 +662,27 @@ with st.sidebar:
     nano_df = surf_df[surf_df["nanoparticle"] == nanoparticle]
 
     conc_values = sorted(nano_df["concentration_value"].dropna().unique().astype(float).tolist())
+    if not conc_values:
+        st.error("No concentration data is available for this formulation.")
+        st.stop()
     min_conc = float(min(conc_values))
     max_conc = float(max(conc_values))
-    conc_step = min(np.diff(sorted(conc_values))).item() / 10 if len(conc_values) > 1 else max_conc or 0.00001
-    concentration_value = st.slider(
-        "Concentration",
-        min_value=min_conc,
-        max_value=max_conc,
-        value=min_conc,
-        step=float(max(conc_step, 0.00001)),
-        format="%.5f",
-    )
+    if len(conc_values) == 1 or np.isclose(min_conc, max_conc):
+        concentration_value = min_conc
+        st.markdown(
+            f"<p class='small-note'><strong>Concentration:</strong> {conc_label(concentration_value)}</p>",
+            unsafe_allow_html=True,
+        )
+    else:
+        conc_step = min(np.diff(sorted(conc_values))).item() / 10
+        concentration_value = st.slider(
+            "Concentration",
+            min_value=min_conc,
+            max_value=max_conc,
+            value=min_conc,
+            step=float(max(conc_step, 0.00001)),
+            format="%.5f",
+        )
     lower_conc, upper_conc, interpolation_weight = concentration_bounds(conc_values, concentration_value)
     concentration = conc_label(concentration_value)
     lower_concentration = conc_label(lower_conc)
