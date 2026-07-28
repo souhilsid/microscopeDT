@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+app_demo/.venv/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Large local-only research data/artifacts
+shared_data/
+01_data_preparation_initial_ml/
+02_current_modeling_workspace/
+app_demo/data/Ready_images.pkl
+app_demo/data/Ready_data.csv
+
+# Generated app outputs
+app_demo/results/
+app_demo/quick_results/
+
